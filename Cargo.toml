@@ -1,0 +1,6 @@
+[package]
+name = "threadpool"
+version = "0.1.0"
+authors = ["nooberfsh <nooberfsh@outlook.com>"]
+
+[dependencies]
