@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::sync::mpsc::{channel, Sender, Receiver};
 use std::thread::{self, JoinHandle};
 
-trait Runable: Ord + Send + Sync + 'static {
+pub trait Runable: Ord + Send + Sync + 'static {
     fn run(&self);
     fn abandon(&self);
 }
 
 type TaskQueue<T> = Arc<Mutex<BinaryHeap<Arc<T>>>>;
 
-struct ThreadPool<T: Runable> {
+pub struct ThreadPool<T: Runable> {
     tasks: TaskQueue<T>,
     sender: Option<Sender<TaskQueue<T>>>,
     receiver: Arc<Mutex<Receiver<TaskQueue<T>>>>,
@@ -18,7 +18,7 @@ struct ThreadPool<T: Runable> {
 }
 
 impl<T: Runable> ThreadPool<T> {
-    fn new(num_worker: usize) -> Self {
+    pub fn new(num_worker: usize) -> Self {
         let (sender, receiver) = channel::<TaskQueue<T>>();
         let receiver = Arc::new(Mutex::new(receiver));
 
@@ -35,10 +35,10 @@ impl<T: Runable> ThreadPool<T> {
                     Ok(queue) => {
                         let run = {
                             let mut lock = queue.lock().unwrap();
-                            assert!(lock.len() > 0);
-                            lock.pop().unwrap()
+                            lock.pop()
                         };
-                        run.run();
+                        // run may be None when threadpool is dropping.
+                        run.map(|t| t.run());
                     }
                     Err(_) => break,
                 }
@@ -53,7 +53,7 @@ impl<T: Runable> ThreadPool<T> {
         }
     }
 
-    fn accept(&self, task: Arc<T>) {
+    pub fn accept(&self, task: Arc<T>) {
         {
             let mut lock = self.tasks.lock().unwrap();
             lock.push(task);
