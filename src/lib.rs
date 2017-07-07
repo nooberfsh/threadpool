@@ -70,7 +70,9 @@ impl<T: Runable> Drop for ThreadPool<T> {
     fn drop(&mut self) {
         {
             let mut lock = self.tasks.lock().unwrap();
-            while let Some(_) = lock.pop() {}
+            while let Some(run) = lock.pop() {
+                run.abandon();
+            }
         }
         // drop sender
         self.sender.take();
