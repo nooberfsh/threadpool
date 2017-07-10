@@ -87,11 +87,15 @@ impl<T: Runable> Drop for ThreadPool<T> {
 
 #[cfg(test)]
 mod tests {
+    extern crate rand;
+
     use super::*;
 
     use std::sync::atomic::{self, AtomicUsize};
     use std::cmp;
     use std::thread;
+    use std::sync::{Arc, Mutex, Condvar};
+    use self::rand::Rng;
 
     struct TaskA<F1, F2>
     where
@@ -183,7 +187,7 @@ mod tests {
         let run_count = Arc::new(AtomicUsize::new(0));
         let task_num = 1000_usize;
         {
-            let tp = ThreadPool::new(1);
+            let tp = ThreadPool::new(4);
             for i in 0..task_num {
                 let t = Arc::new(TaskA::new(i));
                 let r = run_count.clone();
@@ -191,10 +195,7 @@ mod tests {
                 t.register_abandon(|| {});
                 tp.accept(t)
             }
-            loop {
-                if tp.waiting_tasks_num() == 0 {
-                    break;
-                }
+            while tp.waiting_tasks_num() != 0 {
                 thread::sleep(std::time::Duration::from_secs(1));
             }
         }
@@ -208,7 +209,7 @@ mod tests {
         let abandon_count = Arc::new(AtomicUsize::new(0));
         let task_num = 1 << 16;
         {
-            let tp = ThreadPool::new(1);
+            let tp = ThreadPool::new(4);
             for i in 0..task_num {
                 let t = Arc::new(TaskA::new(i));
                 let r = run_count.clone();
@@ -221,5 +222,48 @@ mod tests {
         let num = run_count.load(atomic::Ordering::SeqCst) +
             abandon_count.load(atomic::Ordering::SeqCst);
         assert_eq!(num, task_num);
+    }
+
+    #[test]
+    fn test_order() {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let max_pri = 1 << 10;
+        let mut pris = vec![];
+        for _ in 0..max_pri {
+            let r = rand::thread_rng().gen_range(0, max_pri);
+            pris.push(r);
+        }
+        pris.insert(0, max_pri);
+        let out_pirs = Arc::new(Mutex::new(Vec::new()));
+        {
+            let tp = ThreadPool::new(1);
+            for i in pris.clone() {
+                let t = Arc::new(TaskA::new(i));
+                let p = pair.clone();
+                let o = out_pirs.clone();
+                t.register_run(move || {
+                    let &(ref lock, ref cvar) = &*p;
+                    let mut started = lock.lock().unwrap();
+                    while !*started {
+                        started = cvar.wait(started).unwrap();
+                    }
+                    let mut lock = o.lock().unwrap();
+                    lock.push(i);
+                });
+                t.register_abandon(|| {});
+                tp.accept(t);
+            }
+
+            while tp.waiting_tasks_num() != 0 {
+                let &(ref lock, ref cvar) = &*pair;
+                let mut started = lock.lock().unwrap();
+                *started = true;
+                cvar.notify_one();
+            }
+        }
+        pris.sort();
+        let v: Vec<_> = pris.into_iter().rev().collect();
+        let o = out_pirs.lock().unwrap().clone();
+        assert_eq!(v, o);
     }
 }
