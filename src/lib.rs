@@ -1,6 +1,6 @@
 use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Sender, Receiver};
+use std::sync::mpsc::{channel, Sender};
 use std::thread::{self, JoinHandle};
 
 pub trait Runable: Ord + Send + Sync + 'static {
@@ -13,7 +13,6 @@ type TaskQueue<T> = Arc<Mutex<BinaryHeap<Arc<T>>>>;
 pub struct ThreadPool<T: Runable> {
     tasks: TaskQueue<T>,
     sender: Option<Sender<TaskQueue<T>>>,
-    receiver: Arc<Mutex<Receiver<TaskQueue<T>>>>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -48,7 +47,6 @@ impl<T: Runable> ThreadPool<T> {
         ThreadPool {
             tasks: Default::default(),
             sender: Some(sender),
-            receiver: receiver,
             workers: workers,
         }
     }
