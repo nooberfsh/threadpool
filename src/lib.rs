@@ -93,69 +93,84 @@ mod tests {
     use std::cmp;
     use std::thread;
 
-    struct TaskA<F: FnOnce() + Send + 'static> {
+    struct TaskA<F1, F2>
+    where
+        F1: FnOnce() + Send + 'static,
+        F2: FnOnce() + Send + 'static,
+    {
         pri: usize,
-        run_count: Arc<AtomicUsize>,
-        abandon_fn: Mutex<Option<F>>,
+        run_fn: Mutex<Option<F1>>,
+        abandon_fn: Mutex<Option<F2>>,
     }
 
-    impl<F> TaskA<F>
+    impl<F1, F2> TaskA<F1, F2>
     where
-        F: FnOnce() + Send + 'static,
+        F1: FnOnce() + Send + 'static,
+        F2: FnOnce() + Send + 'static,
     {
-        fn new(pri: usize, run_count: Arc<AtomicUsize>) -> Self {
+        fn new(pri: usize) -> Self {
             TaskA {
                 pri: pri,
-                run_count: run_count,
+                run_fn: Default::default(),
                 abandon_fn: Default::default(),
             }
         }
 
-        fn register_abandon(&self, f: F) {
+        fn register_run(&self, f: F1) {
+            let mut lock = self.run_fn.lock().unwrap();
+            *lock = Some(f);
+        }
+
+        fn register_abandon(&self, f: F2) {
             let mut lock = self.abandon_fn.lock().unwrap();
             *lock = Some(f);
         }
     }
 
-    impl<F> Ord for TaskA<F>
+    impl<F1, F2> Ord for TaskA<F1, F2>
     where
-        F: FnOnce() + Send + 'static,
+        F1: FnOnce() + Send + 'static,
+        F2: FnOnce() + Send + 'static,
     {
         fn cmp(&self, other: &Self) -> cmp::Ordering {
             self.pri.cmp(&other.pri)
         }
     }
 
-    impl<F> PartialOrd for TaskA<F>
+    impl<F1, F2> PartialOrd for TaskA<F1, F2>
     where
-        F: FnOnce() + Send + 'static,
+        F1: FnOnce() + Send + 'static,
+        F2: FnOnce() + Send + 'static,
     {
         fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
             Some(self.cmp(other))
         }
     }
 
-    impl<F> Eq for TaskA<F>
+    impl<F1, F2> Eq for TaskA<F1, F2>
     where
-        F: FnOnce() + Send + 'static,
+        F1: FnOnce() + Send + 'static,
+        F2: FnOnce() + Send + 'static,
     {
     }
 
-    impl<F> PartialEq for TaskA<F>
+    impl<F1, F2> PartialEq for TaskA<F1, F2>
     where
-        F: FnOnce() + Send + 'static,
+        F1: FnOnce() + Send + 'static,
+        F2: FnOnce() + Send + 'static,
     {
         fn eq(&self, other: &Self) -> bool {
             self.pri == other.pri
         }
     }
 
-    impl<F> Runable for TaskA<F>
+    impl<F1, F2> Runable for TaskA<F1, F2>
     where
-        F: FnOnce() + Send + 'static,
+        F1: FnOnce() + Send + 'static,
+        F2: FnOnce() + Send + 'static,
     {
         fn run(&self) {
-            self.run_count.fetch_add(1, atomic::Ordering::SeqCst);
+            self.run_fn.lock().unwrap().take().map(|t| t());
         }
 
         fn abandon(&self) {
@@ -170,7 +185,9 @@ mod tests {
         {
             let tp = ThreadPool::new(1);
             for i in 0..task_num {
-                let t = Arc::new(TaskA::new(i, run_count.clone()));
+                let t = Arc::new(TaskA::new(i));
+                let r = run_count.clone();
+                t.register_run(move || { r.fetch_add(1, atomic::Ordering::SeqCst); });
                 t.register_abandon(|| {});
                 tp.accept(t)
             }
@@ -189,12 +206,14 @@ mod tests {
     fn test_drop() {
         let run_count = Arc::new(AtomicUsize::new(0));
         let abandon_count = Arc::new(AtomicUsize::new(0));
-        let task_num = 1 << 20;
+        let task_num = 1 << 16;
         {
             let tp = ThreadPool::new(1);
             for i in 0..task_num {
-                let t = Arc::new(TaskA::new(i, run_count.clone()));
+                let t = Arc::new(TaskA::new(i));
+                let r = run_count.clone();
                 let a = abandon_count.clone();
+                t.register_run(move || { r.fetch_add(1, atomic::Ordering::SeqCst); });
                 t.register_abandon(move || { a.fetch_add(1, atomic::Ordering::SeqCst); });
                 tp.accept(t)
             }
