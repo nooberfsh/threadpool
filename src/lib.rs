@@ -1,269 +1,203 @@
-use std::collections::BinaryHeap;
-use std::sync::{Arc, Mutex};
-use std::sync::mpsc::{channel, Sender};
+extern crate crossbeam_channel;
+#[macro_use]
+extern crate log;
+extern crate num_cpus;
+
 use std::thread::{self, JoinHandle};
+use std::marker::PhantomData;
 
-pub trait Runable: Ord + Send + Sync + 'static {
-    fn run(&self);
-    fn abandon(&self);
+use crossbeam_channel::{Receiver, Sender};
+
+#[derive(Debug)]
+pub struct Stopped;
+
+pub trait Task: Send + 'static {
+    fn run(&mut self);
 }
 
-type TaskQueue<T> = Arc<Mutex<BinaryHeap<Arc<T>>>>;
-
-pub struct ThreadPool<T: Runable> {
-    tasks: TaskQueue<T>,
-    sender: Option<Sender<TaskQueue<T>>>,
-    workers: Vec<JoinHandle<()>>,
+pub struct Builder<T: Task> {
+    name: String,
+    num: usize,
+    _marker: PhantomData<T>,
 }
 
-impl<T: Runable> ThreadPool<T> {
-    pub fn new(num_worker: usize) -> Self {
-        let (sender, receiver) = channel::<TaskQueue<T>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+pub struct ThreadPool<T: Task> {
+    name: String,
+    tx: Sender<Option<T>>,
+    workers: Vec<Worker<T>>,
+}
 
-        let mut workers = vec![];
-        for _ in 0..num_worker {
-            let recv = receiver.clone();
-            workers.push(thread::spawn(move || loop {
-                let message = {
-                    let lock = recv.lock().unwrap();
-                    lock.recv()
-                };
+pub struct Handle<T: Task> {
+    tx: Sender<Option<T>>,
+}
 
-                match message {
-                    Ok(queue) => {
-                        let run = {
-                            let mut lock = queue.lock().unwrap();
-                            lock.pop()
-                        };
-                        // run may be None when threadpool is dropping.
-                        run.map(|t| t.run());
-                    }
-                    Err(_) => break,
-                }
-            }));
+impl<T: Task> Builder<T> {
+    pub fn new() -> Self {
+        Builder {
+            name: "threadpool".into(),
+            num: num_cpus::get(),
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn name<N: Into<String>>(mut self, name: N) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn worker_count(mut self, count: usize) -> Self {
+        self.num = count;
+        self
+    }
+
+    pub fn build(self) -> ThreadPool<T> {
+        let mut workers = Vec::with_capacity(self.num);
+        let (tx, rx) = crossbeam_channel::unbounded();
+        for i in 0..self.num {
+            let rx = rx.clone();
+            let name = format!("{}_worker_{}", self.name, i);
+            let worker = Worker::new(name, rx);
+            workers.push(worker);
         }
 
         ThreadPool {
-            tasks: Default::default(),
-            sender: Some(sender),
+            name: self.name,
+            tx: tx,
             workers: workers,
         }
     }
+}
 
-    pub fn accept(&self, task: Arc<T>) {
-        {
-            let mut lock = self.tasks.lock().unwrap();
-            lock.push(task);
-        }
-        self.sender
-            .as_ref()
-            .unwrap()
-            .send(self.tasks.clone())
-            .unwrap();
-    }
-
-    pub fn waiting_tasks_num(&self) -> usize {
-        let lock = self.tasks.lock().unwrap();
-        lock.len()
+impl<T: Task> Default for Builder<T> {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl<T: Runable> Drop for ThreadPool<T> {
+impl<T: Task> ThreadPool<T> {
+    pub fn new() -> Self {
+        Builder::new().build()
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    pub fn send(&self, task: T) {
+        self.tx.send(Some(task)).unwrap();
+    }
+
+    pub fn handle(&self) -> Handle<T> {
+        Handle {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl<T: Task> Default for ThreadPool<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Task> Drop for ThreadPool<T> {
     fn drop(&mut self) {
-        {
-            let mut lock = self.tasks.lock().unwrap();
-            while let Some(run) = lock.pop() {
-                run.abandon();
-            }
+        info!("ThreadPool: {} is dropping", self.name);
+        for _ in 0..self.worker_count() {
+            self.tx.send(None).unwrap();
         }
-        // drop sender
-        self.sender.take();
-        while let Some(w) = self.workers.pop() {
-            w.join().unwrap();
+    }
+}
+
+impl<T: Task> Handle<T> {
+    pub fn send(&self, task: T) -> Result<(), Stopped> {
+        self.tx.send(Some(task)).map_err(|_| Stopped)
+    }
+}
+
+struct Worker<T: Task> {
+    thread: Option<JoinHandle<()>>,
+    _marker: PhantomData<T>,
+}
+
+impl<T: Task> Worker<T> {
+    fn new<N: Into<String>>(name: N, rx: Receiver<Option<T>>) -> Self {
+        let thread = thread::Builder::new()
+            .name(name.into())
+            .spawn(move || run(&rx))
+            .unwrap();
+        Worker {
+            thread: Some(thread),
+            _marker: PhantomData,
         }
+    }
+}
+
+fn run<T: Task>(rx: &Receiver<Option<T>>) {
+    while let Some(mut task) = rx.recv().unwrap() {
+        task.run();
+    }
+}
+
+impl<T: Task> Drop for Worker<T> {
+    fn drop(&mut self) {
+        self.thread.take().unwrap().join().unwrap();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    extern crate rand;
-
     use super::*;
 
-    use std::sync::atomic::{self, AtomicUsize};
-    use std::cmp;
-    use std::thread;
-    use std::sync::{Arc, Mutex, Condvar};
-    use self::rand::Rng;
+    use std::time::{Duration, Instant};
 
-    struct TaskA<F1, F2>
-    where
-        F1: FnOnce() + Send + 'static,
-        F2: FnOnce() + Send + 'static,
-    {
-        pri: usize,
-        run_fn: Mutex<Option<F1>>,
-        abandon_fn: Mutex<Option<F2>>,
-    }
+    #[test]
+    fn test_threadpool() {
+        let pool = Builder::new().worker_count(2).build();
 
-    impl<F1, F2> TaskA<F1, F2>
-    where
-        F1: FnOnce() + Send + 'static,
-        F2: FnOnce() + Send + 'static,
-    {
-        fn new(pri: usize) -> Self {
-            TaskA {
-                pri: pri,
-                run_fn: Default::default(),
-                abandon_fn: Default::default(),
-            }
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let start = Instant::now();
+        for dur in vec![500, 1000, 1500] {
+            let task = MyTask {
+                dur: dur,
+                tx: tx.clone(),
+            };
+            pool.send(task);
         }
+        assert_eq!(rx.recv().unwrap(), 500);
+        assert_eq!(rx.recv().unwrap(), 1000);
+        assert_eq!(rx.recv().unwrap(), 1500);
 
-        fn register_run(&self, f: F1) {
-            let mut lock = self.run_fn.lock().unwrap();
-            *lock = Some(f);
-        }
-
-        fn register_abandon(&self, f: F2) {
-            let mut lock = self.abandon_fn.lock().unwrap();
-            *lock = Some(f);
-        }
-    }
-
-    impl<F1, F2> Ord for TaskA<F1, F2>
-    where
-        F1: FnOnce() + Send + 'static,
-        F2: FnOnce() + Send + 'static,
-    {
-        fn cmp(&self, other: &Self) -> cmp::Ordering {
-            self.pri.cmp(&other.pri)
-        }
-    }
-
-    impl<F1, F2> PartialOrd for TaskA<F1, F2>
-    where
-        F1: FnOnce() + Send + 'static,
-        F2: FnOnce() + Send + 'static,
-    {
-        fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
-            Some(self.cmp(other))
-        }
-    }
-
-    impl<F1, F2> Eq for TaskA<F1, F2>
-    where
-        F1: FnOnce() + Send + 'static,
-        F2: FnOnce() + Send + 'static,
-    {
-    }
-
-    impl<F1, F2> PartialEq for TaskA<F1, F2>
-    where
-        F1: FnOnce() + Send + 'static,
-        F2: FnOnce() + Send + 'static,
-    {
-        fn eq(&self, other: &Self) -> bool {
-            self.pri == other.pri
-        }
-    }
-
-    impl<F1, F2> Runable for TaskA<F1, F2>
-    where
-        F1: FnOnce() + Send + 'static,
-        F2: FnOnce() + Send + 'static,
-    {
-        fn run(&self) {
-            self.run_fn.lock().unwrap().take().map(|t| t());
-        }
-
-        fn abandon(&self) {
-            self.abandon_fn.lock().unwrap().take().map(|t| t());
-        }
+        assert!(start.elapsed() > Duration::from_millis(2000));
+        assert!(start.elapsed() < Duration::from_millis(3000));
     }
 
     #[test]
-    fn test_new() {
-        let run_count = Arc::new(AtomicUsize::new(0));
-        let task_num = 1000_usize;
-        {
-            let tp = ThreadPool::new(4);
-            for i in 0..task_num {
-                let t = Arc::new(TaskA::new(i));
-                let r = run_count.clone();
-                t.register_run(move || { r.fetch_add(1, atomic::Ordering::SeqCst); });
-                t.register_abandon(|| {});
-                tp.accept(t)
-            }
-            while tp.waiting_tasks_num() != 0 {
-                thread::sleep(std::time::Duration::from_secs(1));
-            }
-        }
-
-        assert_eq!(task_num, run_count.load(atomic::Ordering::SeqCst));
+    fn test_handle() {
+        let pool = Builder::new().worker_count(2).build();
+        let handle = pool.handle();
+        drop(pool);
+        let res = handle.send(Empty);
+        assert!(res.is_err());
     }
 
-    #[test]
-    fn test_drop() {
-        let run_count = Arc::new(AtomicUsize::new(0));
-        let abandon_count = Arc::new(AtomicUsize::new(0));
-        let task_num = 1 << 16;
-        {
-            let tp = ThreadPool::new(4);
-            for i in 0..task_num {
-                let t = Arc::new(TaskA::new(i));
-                let r = run_count.clone();
-                let a = abandon_count.clone();
-                t.register_run(move || { r.fetch_add(1, atomic::Ordering::SeqCst); });
-                t.register_abandon(move || { a.fetch_add(1, atomic::Ordering::SeqCst); });
-                tp.accept(t)
-            }
+    struct MyTask {
+        dur: u64,
+        tx: Sender<u64>,
+    }
+    impl Task for MyTask {
+        fn run(&mut self) {
+            thread::sleep(Duration::from_millis(self.dur));
+            self.tx.send(self.dur).unwrap();
         }
-        let num = run_count.load(atomic::Ordering::SeqCst) +
-            abandon_count.load(atomic::Ordering::SeqCst);
-        assert_eq!(num, task_num);
     }
 
-    #[test]
-    fn test_order() {
-        let pair = Arc::new((Mutex::new(false), Condvar::new()));
-        let max_pri = 1 << 10;
-        let mut pris = vec![];
-        for _ in 0..max_pri {
-            let r = rand::thread_rng().gen_range(0, max_pri);
-            pris.push(r);
-        }
-        pris.insert(0, max_pri);
-        let out_pirs = Arc::new(Mutex::new(Vec::new()));
-        {
-            let tp = ThreadPool::new(1);
-            for i in pris.clone() {
-                let t = Arc::new(TaskA::new(i));
-                let p = pair.clone();
-                let o = out_pirs.clone();
-                t.register_run(move || {
-                    let &(ref lock, ref cvar) = &*p;
-                    let mut started = lock.lock().unwrap();
-                    while !*started {
-                        started = cvar.wait(started).unwrap();
-                    }
-                    let mut lock = o.lock().unwrap();
-                    lock.push(i);
-                });
-                t.register_abandon(|| {});
-                tp.accept(t);
-            }
-
-            while tp.waiting_tasks_num() != 0 {
-                let &(ref lock, ref cvar) = &*pair;
-                let mut started = lock.lock().unwrap();
-                *started = true;
-                cvar.notify_one();
-            }
-        }
-        pris.sort();
-        let v: Vec<_> = pris.into_iter().rev().collect();
-        let o = out_pirs.lock().unwrap().clone();
-        assert_eq!(v, o);
+    struct Empty;
+    impl Task for Empty {
+        fn run(&mut self) {}
     }
 }
