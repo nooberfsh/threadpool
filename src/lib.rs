@@ -3,15 +3,13 @@
 //! Example
 //!
 //! ```
-//! use std::sync::Arc;
-
 //! use threadpool::Task;
 //! use threadpool::Builder;
-
+//!
 //! struct Simple {
 //!     name: String,
 //! }
-
+//!
 //! impl Task for Simple {
 //!     fn run(&mut self) {
 //!         println!("{} done", self.name);

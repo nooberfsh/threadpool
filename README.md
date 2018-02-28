@@ -6,8 +6,6 @@ A simple thread pool.
 ```rust
 extern crate threadpool;
 
-use std::sync::Arc;
-
 use threadpool::Task;
 use threadpool::Builder;
 
