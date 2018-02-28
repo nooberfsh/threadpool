@@ -87,7 +87,7 @@ impl<T: Task> ThreadPool<T> {
         self.workers.len()
     }
 
-    pub fn send(&self, task: T) {
+    pub fn spawn(&self, task: T) {
         self.tx.send(Some(task)).unwrap();
     }
 
@@ -114,7 +114,7 @@ impl<T: Task> Drop for ThreadPool<T> {
 }
 
 impl<T: Task> Handle<T> {
-    pub fn send(&self, task: T) -> Result<(), Stopped> {
+    pub fn spawn(&self, task: T) -> Result<(), Stopped> {
         self.tx.send(Some(task)).map_err(|_| Stopped)
     }
 }
@@ -166,7 +166,7 @@ mod tests {
                 dur: dur,
                 tx: tx.clone(),
             };
-            pool.send(task);
+            pool.spawn(task);
         }
         assert_eq!(rx.recv().unwrap(), 500);
         assert_eq!(rx.recv().unwrap(), 1000);
@@ -181,7 +181,7 @@ mod tests {
         let pool = Builder::new().worker_count(2).build();
         let handle = pool.handle();
         drop(pool);
-        let res = handle.send(Empty);
+        let res = handle.spawn(Empty);
         assert!(res.is_err());
     }
 
